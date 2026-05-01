@@ -408,6 +408,10 @@ const (
 	// Write OTP_CTL_START before reading, OTP_CTL_STOP after.
 	P1_OTP_CTL = uint8(0x05)
 
+	// P1_DEMOD_CFG: BLE Coded PHY demodulator control. (P1 only)
+	// bit[5]=DEMOD_BLE_LONG_RANGE, bit[4]=DEMOD_EN_OFF_EST_TIMEOUT.
+	P1_DEMOD_CFG = uint8(0x0B)
+
 	// P1_CAL_CTL: calibration FSM control. Dual-use with TXHDR0_CFG (0x1B).
 	// [7]=FSM_DCOC [6]=FSM_BW_CAL [5]=FSM_OFST_CAL [4]=FSM_2P_CAL
 	// [3]=FSM_VCO_CAL [0]=CAL_EN.
@@ -648,8 +652,11 @@ const (
 	// Spread-spectrum / FEC bits.
 	PRI_TX_FEC_BIT = uint8(0x08)
 	PRI_RX_FEC_BIT = uint8(0x04)
-	PRI_CI_S2      = uint8(0x01)
-	PRI_CI_S8      = uint8(0x02)
+	PRI_CI_S2 = uint8(0x01)
+	PRI_CI_S8 = uint8(0x00) // corrected: 0x02 was the reserved value; S8=PRI_CI_MODE=00
+
+	// P1_DEMOD_LR: write to P1_DEMOD_CFG to enable BLE Coded PHY (LongRange) demodulator.
+	P1_DEMOD_LR = uint8(0x30)
 
 	// PKT_EXT_CFG_BLE: auto-insert 2-byte BLE header (PDU type + length).
 	PKT_EXT_CFG_BLE = HDR_LEN_EXIST_BIT | HDR_LEN_2_BIT // 0x60

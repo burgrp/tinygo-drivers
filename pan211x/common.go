@@ -1,6 +1,59 @@
 package pan211x
 
-import "errors"
+import (
+	"errors"
+	"runtime"
+	"time"
+)
+
+func enableRxAddress(r Registers, pipeIndex uint8, addr []byte) error {
+	if pipeIndex > 5 {
+		return errors.New("invalid pipe index")
+	}
+	if err := ensureSTB3(r); err != nil {
+		return err
+	}
+	switch pipeIndex {
+	case 0:
+		if err := writeAddrBytes(r, PIPE0_RXADDR0, addr); err != nil {
+			return err
+		}
+	case 1:
+		if err := writeAddrBytes(r, PIPE1_RXADDR0, addr); err != nil {
+			return err
+		}
+	default:
+		lsbReg := PIPE2_RXADDR0 + pipeIndex - 2
+		if err := r.Write(lsbReg, addr[0]); err != nil {
+			return err
+		}
+	}
+	mask, err := r.Read(RXPIPE_CFG)
+	if err != nil {
+		return err
+	}
+	if err := r.Write(RXPIPE_CFG, mask|(1<<pipeIndex)); err != nil {
+		return err
+	}
+	return enterRX(r)
+}
+
+func disableRxAddress(r Registers, pipeIndex uint8) error {
+	if pipeIndex > 5 {
+		return errors.New("invalid pipe index")
+	}
+	if err := ensureSTB3(r); err != nil {
+		return err
+	}
+	mask, err := r.Read(RXPIPE_CFG)
+	if err != nil {
+		return err
+	}
+	if err := r.Write(RXPIPE_CFG, mask&^(1<<pipeIndex)); err != nil {
+		return err
+	}
+	return enterRX(r)
+}
 
 var (
 	ErrPayloadTooLarge = errors.New("payload too large")
@@ -35,6 +88,151 @@ const (
 	SerialInterfaceSPI4W SerialInterface = 1
 	SerialInterfaceI2C   SerialInterface = 2
 )
+
+func pollBit(r Registers, reg, bit uint8, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		v, err := r.Read(reg)
+		if err != nil {
+			return err
+		}
+		if v&bit != 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return ErrTimeout
+		}
+		runtime.Gosched()
+	}
+}
+
+func enterRX(r Registers) error {
+	if err := r.Write(STATE_CFG, STATE_STB3); err != nil {
+		return err
+	}
+	if err := r.Write(RFIRQFLG, IRQ_ALL); err != nil {
+		return err
+	}
+	return r.Write(STATE_CFG, STATE_RX)
+}
+
+func ensureSTB3(r Registers) error {
+	return r.Write(STATE_CFG, STATE_STB3)
+}
+
+func writeAddrBytes(r Registers, startReg uint8, addr []byte) error {
+	for i, b := range addr {
+		if err := r.Write(startReg+uint8(i), b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// send is the shared TX implementation. dst is written to TXADDR0 when non-nil (XN297L);
+// pass nil to skip the address write (BLE LongRange uses a fixed sync word).
+func send(r Registers, maxPayload uint8, dst []byte, payload []byte) error {
+	if uint8(len(payload)) > maxPayload {
+		return ErrPayloadTooLarge
+	}
+	if err := ensureSTB3(r); err != nil {
+		return err
+	}
+	if len(dst) > 0 {
+		if err := writeAddrBytes(r, TXADDR0, dst); err != nil {
+			return err
+		}
+	}
+	if err := r.Write(TXPLLEN_CFG, uint8(len(payload))); err != nil {
+		return err
+	}
+	if err := r.WriteBuffer(TRX_FIFO, payload); err != nil {
+		return err
+	}
+	if err := r.Write(RFIRQFLG, IRQ_ALL); err != nil {
+		return err
+	}
+	if err := r.Write(STATE_CFG, STATE_TX); err != nil {
+		return err
+	}
+	txErr := pollBit(r, RFIRQFLG, IRQ_TX, 10*time.Millisecond)
+	_ = enterRX(r)
+	return txErr
+}
+
+// receive is the shared RX poll implementation.
+func receive(r Registers, buf []byte) (int, bool) {
+	flags, err := r.Read(RFIRQFLG)
+	if err != nil || flags&IRQ_RX == 0 {
+		return 0, false
+	}
+	length, err := r.Read(STATUS3)
+	if err != nil {
+		return 0, false
+	}
+	if int(length) > len(buf) {
+		length = uint8(len(buf))
+	}
+	if err := r.ReadBuffer(TRX_FIFO, buf[:length]); err != nil {
+		return 0, false
+	}
+	_ = r.Write(RFIRQFLG, IRQ_ALL)
+	return int(length), true
+}
+
+// runCalibration runs the 5-phase RF calibration sequence on Page 1, then restores
+// Page 0 and enters RX. Must be called while on Page 0.
+func runCalibration(r Registers) error {
+	if err := r.Write(PAGE_CFG, 0x01); err != nil {
+		return err
+	}
+
+	if err := r.Write(P1_CAL_CTL, CAL_VCO); err != nil {
+		return err
+	}
+	if err := pollBit(r, P1_CAL_STATUS_VCO, CAL_VCO_DONE_BIT, 5*time.Millisecond); err != nil {
+		return ErrCalibration
+	}
+
+	if err := r.Write(P1_CAL_CTL, CAL_THERMAL); err != nil {
+		return err
+	}
+	time.Sleep(55 * time.Millisecond)
+
+	// Phase 3 requires RX mode; STATE_CFG is shared and accessible from Page 1.
+	if err := r.Write(STATE_CFG, STATE_RX); err != nil {
+		return err
+	}
+	time.Sleep(200 * time.Microsecond)
+	if err := r.Write(P1_CAL_CTL, CAL_FREQ); err != nil {
+		return err
+	}
+	if err := pollBit(r, P1_CAL_STATUS_DONE, CAL_DONE_BIT, 5*time.Millisecond); err != nil {
+		return ErrCalibration
+	}
+
+	if err := r.Write(P1_CAL_CTL, CAL_PHASE1); err != nil {
+		return err
+	}
+	if err := pollBit(r, P1_CAL_STATUS_PHASE1, CAL_PHASE1_DONE_BIT, 5*time.Millisecond); err != nil {
+		return ErrCalibration
+	}
+
+	if err := r.Write(P1_CAL_CTL, CAL_PHASE2); err != nil {
+		return err
+	}
+	if err := pollBit(r, P1_CAL_STATUS_DONE, CAL_DONE_BIT, 5*time.Millisecond); err != nil {
+		return ErrCalibration
+	}
+
+	if err := r.Write(P1_CAL_CTL, CAL_STOP); err != nil {
+		return err
+	}
+	if err := r.Write(PAGE_CFG, 0x00); err != nil {
+		return err
+	}
+	return enterRX(r)
+}
 
 // DumpState prints key register values with decoded field meanings for debugging.
 func DumpState(r Registers) {

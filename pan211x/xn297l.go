@@ -1,10 +1,6 @@
 package pan211x
 
-import (
-	"errors"
-	"runtime"
-	"time"
-)
+import "time"
 
 type AddressXN297L [5]byte
 
@@ -19,55 +15,13 @@ type DriverXN297L struct {
 	payloadLen uint8
 }
 
-func NewDriver(registers Registers) *DriverXN297L {
+func NewDriverXN297L(registers Registers) *DriverXN297L {
 	return &DriverXN297L{registers: registers}
 }
 
-// pollBit reads reg until (val & bit) != 0, yielding the scheduler between reads.
-func (d *DriverXN297L) pollBit(reg, bit uint8, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		v, err := d.registers.Read(reg)
-		if err != nil {
-			return err
-		}
-		if v&bit != 0 {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return ErrTimeout
-		}
-		runtime.Gosched()
-	}
-}
-
-func (d *DriverXN297L) enterRX() error {
-	if err := d.registers.Write(STATE_CFG, STATE_STB3); err != nil {
-		return err
-	}
-	if err := d.registers.Write(RFIRQFLG, IRQ_ALL); err != nil {
-		return err
-	}
-	return d.registers.Write(STATE_CFG, STATE_RX)
-}
-
-func (d *DriverXN297L) ensureSTB3() error {
-	return d.registers.Write(STATE_CFG, STATE_STB3)
-}
-
-// writeAddr writes a 5-byte address as individual register writes starting at startReg.
-func (d *DriverXN297L) writeAddr(startReg uint8, addr AddressXN297L) error {
-	for i, b := range addr {
-		if err := d.registers.Write(startReg+uint8(i), b); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// InitXN297L initialises the chip for XN297L Normal mode (fixed payload, no auto-ACK).
+// Init initialises the chip for XN297L Normal mode (fixed payload, no auto-ACK).
 // Crystal: 16 MHz. TX power: 9 dBm. Caller must call SetChannel after this returns.
-func (d *DriverXN297L) InitXN297L(cfg ConfigXN297L) error {
+func (d *DriverXN297L) Init(cfg ConfigXN297L) error {
 	d.payloadLen = cfg.PayloadLen
 	r := d.registers
 
@@ -279,63 +233,7 @@ func (d *DriverXN297L) InitXN297L(cfg ConfigXN297L) error {
 	}
 
 	// Step 6: RF calibration — 5 phases in strict order on Page 1.
-	if err := r.Write(PAGE_CFG, 0x01); err != nil {
-		return err
-	}
-
-	// Phase 1: VCO calibration.
-	if err := r.Write(P1_CAL_CTL, CAL_VCO); err != nil {
-		return err
-	}
-	if err := d.pollBit(P1_CAL_STATUS_VCO, CAL_VCO_DONE_BIT, 5*time.Millisecond); err != nil {
-		return ErrCalibration
-	}
-
-	// Phase 2: thermal (2-point) calibration — mandatory 55 ms, no status register.
-	if err := r.Write(P1_CAL_CTL, CAL_THERMAL); err != nil {
-		return err
-	}
-	time.Sleep(55 * time.Millisecond)
-
-	// Phase 3: frequency offset calibration.
-	// STATE_CFG is a shared register, writable from Page 1.
-	// The chip must be in RX mode and the RFPLL must lock (≥200 µs) before triggering.
-	if err := r.Write(STATE_CFG, STATE_RX); err != nil {
-		return err
-	}
-	time.Sleep(200 * time.Microsecond)
-	if err := r.Write(P1_CAL_CTL, CAL_FREQ); err != nil {
-		return err
-	}
-	if err := d.pollBit(P1_CAL_STATUS_DONE, CAL_DONE_BIT, 5*time.Millisecond); err != nil {
-		return ErrCalibration
-	}
-
-	// Phase 4: BW / filter calibration.
-	if err := r.Write(P1_CAL_CTL, CAL_PHASE1); err != nil {
-		return err
-	}
-	if err := d.pollBit(P1_CAL_STATUS_PHASE1, CAL_PHASE1_DONE_BIT, 5*time.Millisecond); err != nil {
-		return ErrCalibration
-	}
-
-	// Phase 5: DC offset calibration.
-	if err := r.Write(P1_CAL_CTL, CAL_PHASE2); err != nil {
-		return err
-	}
-	if err := d.pollBit(P1_CAL_STATUS_DONE, CAL_DONE_BIT, 5*time.Millisecond); err != nil {
-		return ErrCalibration
-	}
-
-	// Wrap up: stop FSM, return to Page 0, enter RX.
-	if err := r.Write(P1_CAL_CTL, CAL_STOP); err != nil {
-		return err
-	}
-	if err := r.Write(PAGE_CFG, 0x00); err != nil {
-		return err
-	}
-	// RF_CHANNEL_CFG is still RF_CH_CAL; caller must call SetChannel before use.
-	return d.enterRX()
+	return runCalibration(r)
 }
 
 // SetChannel sets the RF channel. ch = frequency_MHz − 2400 (valid 0–83).
@@ -343,121 +241,35 @@ func (d *DriverXN297L) SetChannel(channel uint8) error {
 	if channel > maxChannel {
 		return ErrInvalidChannel
 	}
-	if err := d.ensureSTB3(); err != nil {
+	if err := ensureSTB3(d.registers); err != nil {
 		return err
 	}
 	if err := d.registers.Write(RF_CHANNEL_CFG, channel); err != nil {
 		return err
 	}
-	return d.enterRX()
+	return enterRX(d.registers)
 }
 
 // EnableRxAddress sets the receive address for pipe pipeIndex (0–5) and enables the pipe.
 // Pipes 0 and 1 use the full 5-byte addr. Pipes 2–5 use only addr[0] (LSB);
 // their upper 4 bytes are shared with pipe 1 and must be set via pipe 1 first.
 func (d *DriverXN297L) EnableRxAddress(pipeIndex uint8, addr AddressXN297L) error {
-	if pipeIndex > 5 {
-		return errors.New("invalid pipe index")
-	}
-	if err := d.ensureSTB3(); err != nil {
-		return err
-	}
-	switch pipeIndex {
-	case 0:
-		if err := d.writeAddr(PIPE0_RXADDR0, addr); err != nil {
-			return err
-		}
-	case 1:
-		if err := d.writeAddr(PIPE1_RXADDR0, addr); err != nil {
-			return err
-		}
-	default:
-		// Pipes 2–5: only the LSB (addr[0]) is individually configurable.
-		lsbReg := PIPE2_RXADDR0 + pipeIndex - 2
-		if err := d.registers.Write(lsbReg, addr[0]); err != nil {
-			return err
-		}
-	}
-	mask, err := d.registers.Read(RXPIPE_CFG)
-	if err != nil {
-		return err
-	}
-	if err := d.registers.Write(RXPIPE_CFG, mask|(1<<pipeIndex)); err != nil {
-		return err
-	}
-	return d.enterRX()
+	return enableRxAddress(d.registers, pipeIndex, addr[:])
 }
 
 // DisableRxAddress disables the given pipe without changing its stored address.
 func (d *DriverXN297L) DisableRxAddress(pipeIndex uint8) error {
-	if pipeIndex > 5 {
-		return errors.New("invalid pipe index")
-	}
-	if err := d.ensureSTB3(); err != nil {
-		return err
-	}
-	mask, err := d.registers.Read(RXPIPE_CFG)
-	if err != nil {
-		return err
-	}
-	if err := d.registers.Write(RXPIPE_CFG, mask&^(1<<pipeIndex)); err != nil {
-		return err
-	}
-	return d.enterRX()
+	return disableRxAddress(d.registers, pipeIndex)
 }
 
 // Send transmits payload to dst. len(payload) must not exceed PayloadLen from config.
 // Blocks until TX complete or ~10 ms timeout, then re-enters RX mode.
 func (d *DriverXN297L) Send(dst AddressXN297L, payload []byte) error {
-	if uint8(len(payload)) > d.payloadLen {
-		return ErrPayloadTooLarge
-	}
-	if err := d.ensureSTB3(); err != nil {
-		return err
-	}
-	if err := d.writeAddr(TXADDR0, dst); err != nil {
-		return err
-	}
-	if err := d.registers.Write(TXPLLEN_CFG, uint8(len(payload))); err != nil {
-		return err
-	}
-	if err := d.registers.WriteBuffer(TRX_FIFO, payload); err != nil {
-		return err
-	}
-	if err := d.registers.Write(RFIRQFLG, IRQ_ALL); err != nil {
-		return err
-	}
-	if err := d.registers.Write(STATE_CFG, STATE_TX); err != nil {
-		return err
-	}
-
-	txErr := d.pollBit(RFIRQFLG, IRQ_TX, 10*time.Millisecond)
-
-	// Always re-enter RX regardless of TX outcome.
-	_ = d.enterRX()
-
-	return txErr
+	return send(d.registers, d.payloadLen, dst[:], payload)
 }
 
 // Receive checks for a received packet without blocking.
 // Returns (n, true) if a packet was available and copied into buf, (0, false) otherwise.
 func (d *DriverXN297L) Receive(buf []byte) (n int, ok bool) {
-
-	flags, err := d.registers.Read(RFIRQFLG)
-	if err != nil || flags&IRQ_RX == 0 {
-		return 0, false
-	}
-
-	length, err := d.registers.Read(STATUS3)
-	if err != nil {
-		return 0, false
-	}
-	if int(length) > len(buf) {
-		length = uint8(len(buf))
-	}
-	if err := d.registers.ReadBuffer(TRX_FIFO, buf[:length]); err != nil {
-		return 0, false
-	}
-	_ = d.registers.Write(RFIRQFLG, IRQ_ALL)
-	return int(length), true
+	return receive(d.registers, buf)
 }
