@@ -2,7 +2,10 @@ package pan211x
 
 import "time"
 
-// SpreadFactor selects the BLE Coded PHY spreading factor.
+// SpreadFactor selects the BLE Coded PHY spreading factor for transmission.
+// It sets the CI field in outgoing packets; the receiver always auto-detects
+// the spread factor from the CI field of incoming packets, so mixed S=2/S=8
+// networks interoperate transparently.
 type SpreadFactor uint8
 
 const (
