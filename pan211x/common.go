@@ -10,8 +10,6 @@ var (
 	ErrInvalidChannel  = errors.New("invalid channel")
 )
 
-type Address [5]byte
-
 type BitRate uint8
 
 const (

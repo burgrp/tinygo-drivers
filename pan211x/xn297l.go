@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+type AddressXN297L [5]byte
+
 type ConfigXN297L struct {
 	BitRate         BitRate
 	PayloadLen      uint8
@@ -54,7 +56,7 @@ func (d *DriverXN297L) ensureSTB3() error {
 }
 
 // writeAddr writes a 5-byte address as individual register writes starting at startReg.
-func (d *DriverXN297L) writeAddr(startReg uint8, addr Address) error {
+func (d *DriverXN297L) writeAddr(startReg uint8, addr AddressXN297L) error {
 	for i, b := range addr {
 		if err := d.registers.Write(startReg+uint8(i), b); err != nil {
 			return err
@@ -353,7 +355,7 @@ func (d *DriverXN297L) SetChannel(channel uint8) error {
 // EnableRxAddress sets the receive address for pipe pipeIndex (0–5) and enables the pipe.
 // Pipes 0 and 1 use the full 5-byte addr. Pipes 2–5 use only addr[0] (LSB);
 // their upper 4 bytes are shared with pipe 1 and must be set via pipe 1 first.
-func (d *DriverXN297L) EnableRxAddress(pipeIndex uint8, addr Address) error {
+func (d *DriverXN297L) EnableRxAddress(pipeIndex uint8, addr AddressXN297L) error {
 	if pipeIndex > 5 {
 		return errors.New("invalid pipe index")
 	}
@@ -406,7 +408,7 @@ func (d *DriverXN297L) DisableRxAddress(pipeIndex uint8) error {
 
 // Send transmits payload to dst. len(payload) must not exceed PayloadLen from config.
 // Blocks until TX complete or ~10 ms timeout, then re-enters RX mode.
-func (d *DriverXN297L) Send(dst Address, payload []byte) error {
+func (d *DriverXN297L) Send(dst AddressXN297L, payload []byte) error {
 	if uint8(len(payload)) > d.payloadLen {
 		return ErrPayloadTooLarge
 	}
