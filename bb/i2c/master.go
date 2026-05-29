@@ -1,3 +1,5 @@
+//go:build tinygo
+
 package i2c
 
 import (

@@ -1,3 +1,5 @@
+//go:build tinygo
+
 package pan211x
 
 import "machine"

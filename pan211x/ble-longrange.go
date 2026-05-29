@@ -15,7 +15,7 @@ const (
 
 // AddressBLE is a 4-byte BLE access address used as the node identifier.
 // It is written to PIPE0_RXADDR (RX filter) during init and to TXADDR on each Send.
-type AddressBLE [4]byte
+type AddressBLE = [4]byte
 
 type ConfigBLELongRange struct {
 	SpreadFactor    SpreadFactor
