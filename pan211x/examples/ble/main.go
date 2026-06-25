@@ -43,7 +43,7 @@ func main() {
 
 	isHub := !pinRoleHub.Get()
 
-	must(pan.SetChannel(10))
+	must(pan.SetChannelBLE(10))
 
 	addr := nodeAddr
 	if isHub {

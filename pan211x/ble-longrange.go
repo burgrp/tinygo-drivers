@@ -34,7 +34,7 @@ func NewDriverBLELongRange(registers Registers) *DriverBLELongRange {
 
 // Init initialises the chip for BLE LongRange (Coded PHY S2/S8) mode.
 // Crystal: 16 MHz. TX power: 9 dBm. Defaults to BLE advertising channel 37 (2402 MHz).
-// Caller must call SetBLEChannel after this returns.
+// Caller must call SetChannelBLE (or SetChannelRF) after this returns.
 func (d *DriverBLELongRange) Init(cfg ConfigBLELongRange) error {
 	d.payloadLen = cfg.PayloadLen
 	r := d.registers
@@ -178,7 +178,7 @@ func (d *DriverBLELongRange) Init(cfg ConfigBLELongRange) error {
 		return err
 	}
 	// ACCADDR_SCR_DIS must be set for all BLE modes — the access address is never whitened.
-	if err := r.Write(WHITEN_CFG, bleWhitenSeed(37)); err != nil {
+	if err := r.Write(WHITEN_CFG, ACCADDR_SCR_DIS_BIT|bleWhitenSeed(37)); err != nil {
 		return err
 	}
 	if err := r.Write(TXAUTO_CFG, 0x00); err != nil {
@@ -245,21 +245,55 @@ func (d *DriverBLELongRange) Init(cfg ConfigBLELongRange) error {
 	return runCalibration(r)
 }
 
-// SetChannel sets the RF channel by BLE logical channel index (0–39).
-// Updates both RF frequency and whitening seed atomically.
+// SetChannelBLE sets the RF channel by BLE logical channel index (0–39).
+// Updates both RF frequency and whitening seed atomically, using the BLE-spec
+// channel-to-frequency map and the BLE-spec whitening seed, so the packets stay
+// BLE Coded PHY compliant. Use this to interoperate with standard BLE Long Range
+// (LE Coded PHY) peers.
 // All 40 BLE channels are valid; channels 37–39 are the standard advertising channels.
-func (d *DriverBLELongRange) SetChannel(bleChIndex uint8) error {
+func (d *DriverBLELongRange) SetChannelBLE(bleChIndex uint8) error {
 	rfCh, ok := bleChannelToRF(bleChIndex)
 	if !ok {
 		return ErrInvalidChannel
 	}
+	return d.setChannel(rfCh, bleWhitenSeed(bleChIndex))
+}
+
+// SetChannelRF tunes to a raw RF channel: the center frequency is
+// 2400 + rfCh MHz, for rfCh in 0–83 (so 2400–2483 MHz). whitenSeed is the 7-bit
+// data-whitening LFSR seed (only the low 7 bits are used); transmitter and
+// receiver must use the same value. ACCADDR_SCR_DIS (the access address is never
+// whitened) is forced on, as the BLE framing the chip uses requires it for the
+// receiver to sync.
+//
+// Unlike SetChannelBLE, this bypasses the BLE channel-to-frequency map and the
+// BLE-spec whitening seed, so the resulting packets are NOT BLE-spec compliant
+// and will not be decoded by standard BLE peers. Use it only for proprietary
+// point-to-point links where you control both ends — e.g. to place a channel in
+// a quiet part of the band, away from Wi-Fi or BLE advertising traffic. Note the
+// band edges (rfCh near 0 and 83) sit at the ISM-band limits, so a modulated
+// carrier there spills outside 2400–2483.5 MHz; keep a margin from the edges.
+func (d *DriverBLELongRange) SetChannelRF(rfCh, whitenSeed uint8) error {
+	if rfCh > maxChannel {
+		return ErrInvalidChannel
+	}
+	return d.setChannel(rfCh, whitenSeed&0x7F)
+}
+
+// setChannel writes the RF frequency and whitening registers atomically and
+// returns the chip to RX. rfCh is the raw RF_CHANNEL_CFG value (center frequency
+// = 2400 + rfCh MHz); whitenSeed is the 7-bit data-whitening seed. ACCADDR_SCR_DIS
+// (the access address is never whitened) is always set, as the BLE framing the
+// chip uses requires it for the receiver to sync. It is the shared core of
+// SetChannelBLE and SetChannelRF.
+func (d *DriverBLELongRange) setChannel(rfCh, whitenSeed uint8) error {
 	if err := ensureSTB3(d.registers); err != nil {
 		return err
 	}
 	if err := d.registers.Write(RF_CHANNEL_CFG, rfCh); err != nil {
 		return err
 	}
-	if err := d.registers.Write(WHITEN_CFG, bleWhitenSeed(bleChIndex)); err != nil {
+	if err := d.registers.Write(WHITEN_CFG, ACCADDR_SCR_DIS_BIT|whitenSeed); err != nil {
 		return err
 	}
 	return enterRX(d.registers)
@@ -283,8 +317,9 @@ func bleChannelToRF(ch uint8) (uint8, bool) {
 	return 0, false
 }
 
-// bleWhitenSeed computes WHITEN_CFG for BLE channel index 0–39.
-// Formula from BLE spec: bit_reverse7(ch | 0x40), with ACCADDR_SCR_DIS always set.
+// bleWhitenSeed computes the 7-bit BLE data-whitening seed for channel index 0–39.
+// Formula from BLE spec: bit_reverse7(ch | 0x40). The ACCADDR_SCR_DIS control bit
+// is applied by setChannel, not here.
 func bleWhitenSeed(ch uint8) uint8 {
 	x := ch | 0x40
 	var r uint8
@@ -292,7 +327,7 @@ func bleWhitenSeed(ch uint8) uint8 {
 		r = (r << 1) | (x & 1)
 		x >>= 1
 	}
-	return ACCADDR_SCR_DIS_BIT | r
+	return r
 }
 
 // EnableRxAddress sets the receive address for pipe pipeIndex (0–5) and enables the pipe.
