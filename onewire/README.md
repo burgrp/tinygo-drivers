@@ -1,7 +1,7 @@
 # 1-Wire and DS18B20 drivers
 
 This module provides a target-neutral standard-speed 1-Wire master and an
-allocation-free driver for one externally powered DS18B20.
+allocation-free driver for externally powered DS18B20 sensors.
 
 The master does not accept a concrete timer peripheral. TinyGo's generated
 timer types and machine APIs differ between targets, so callers implement the
@@ -56,6 +56,49 @@ if status == ds18b20.StatusOK {
 }
 ```
 
+For a multidrop bus, enumerate IDs with `onewire.Searcher`, configure each
+addressed sensor, then broadcast one conversion and read sensors individually:
+
+```go
+var searcher onewire.Searcher
+for {
+	found, searchStatus := searcher.Next(&master)
+	if searchStatus == onewire.SearchDone {
+		break
+	}
+	if searchStatus != onewire.SearchFound {
+		// Handle bus or registration-number fault.
+		break
+	}
+	rom := ds18b20.ROM(found)
+	if status := rom.Validate(); status != ds18b20.StatusOK {
+		continue
+	}
+	// Store rom in fixed application-owned memory.
+}
+
+network := ds18b20.NewNetwork(&master)
+if status := network.RequireExternalPowerAll(); status != ds18b20.StatusOK {
+	// At least one device requires unsupported parasite power.
+}
+for _, rom := range configuredROMs {
+	if status := network.Configure12Bit(rom); status != ds18b20.StatusOK {
+		// Mark this sensor unavailable.
+	}
+}
+if status := network.StartConversionAll(); status == ds18b20.StatusOK {
+	// Wait ConversionWait12Bit while continuing to service the application.
+}
+for _, rom := range configuredROMs {
+	raw, status := network.ReadTemperatureRaw(rom)
+	_, _ = raw, status
+}
+```
+
+Each addressed read is a separate transaction. Applications with latency-sensitive
+work should return to their main loop between calls rather than reading an entire
+bus in one uninterrupted loop.
+
 Import the packages as:
 
 ```go
@@ -65,15 +108,12 @@ import (
 )
 ```
 
-The current DS18B20 driver intentionally supports one device on the bus. It uses
-Read ROM to validate the family code and ROM CRC, then Skip ROM for subsequent
-commands. The installation must guarantee that exactly one device is connected;
-Read ROM cannot prove that independently. `Configure12Bit` rejects parasite
-power, preserves the alarm bytes, changes resolution only in the volatile
-scratchpad, and verifies the result. It must succeed before conversion or
-temperature methods are used. A bus or scratchpad fault clears that validation.
-Search ROM, multidrop, parasite-power strong pull-up, and EEPROM writes are
-outside this API.
+`NewSingleDrop` uses Read ROM once and Skip ROM thereafter; the installation must
+guarantee that exactly one device is connected. `NewNetwork` uses Match ROM for
+per-sensor operations and Skip ROM only to broadcast Convert T. Both configuration
+paths reject parasite power, preserve the alarm bytes, change resolution only in
+the volatile scratchpad, and verify the result. Parasite-power strong pull-up and
+EEPROM writes are outside this API.
 
 ## Validation
 

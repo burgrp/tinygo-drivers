@@ -1,4 +1,4 @@
-// Package ds18b20 drives one externally powered DS18B20 on a 1-Wire bus.
+// Package ds18b20 drives externally powered DS18B20s on a 1-Wire bus.
 package ds18b20
 
 import (
@@ -20,6 +20,7 @@ const (
 	commandReadScratchpad  = 0xbe
 	commandSkipROM         = 0xcc
 	commandReadROM         = 0x33
+	commandMatchROM        = 0x55
 	configuration12Bit     = 0x7f
 )
 
@@ -72,6 +73,129 @@ func (status Status) String() string {
 // ROM is a DS18B20's 64-bit registration number, including family and CRC.
 type ROM [8]byte
 
+// Validate checks the DS18B20 family code and registration-number CRC.
+func (rom ROM) Validate() Status {
+	if onewire.CRC8(rom[:7]) != rom[7] {
+		return StatusROMCRC
+	}
+	if rom[0] != FamilyCode {
+		return StatusWrongFamily
+	}
+	return StatusOK
+}
+
+// Network drives addressed DS18B20s on a multidrop 1-Wire bus.
+type Network struct {
+	bus onewire.Bus
+}
+
+// NewNetwork creates a driver for externally powered, explicitly addressed
+// DS18B20s sharing one bus.
+func NewNetwork(bus onewire.Bus) Network {
+	return Network{bus: bus}
+}
+
+// Configure12Bit selects volatile 12-bit resolution for one addressed sensor.
+func (network *Network) Configure12Bit(rom ROM) Status {
+	if status := rom.Validate(); status != StatusOK {
+		return status
+	}
+	if status := network.requireExternalPower(rom); status != StatusOK {
+		return status
+	}
+
+	scratchpad, status := network.readScratchpad(rom)
+	if status != StatusOK {
+		return status
+	}
+	if scratchpad[4]&0x60 == 0x60 {
+		return StatusOK
+	}
+
+	if status := network.selectROM(rom); status != StatusOK {
+		return status
+	}
+	network.bus.SendByte(commandWriteScratchpad)
+	network.bus.SendByte(scratchpad[2])
+	network.bus.SendByte(scratchpad[3])
+	network.bus.SendByte(configuration12Bit)
+
+	verification, status := network.readScratchpad(rom)
+	if status != StatusOK {
+		return status
+	}
+	if verification[4]&0x60 != 0x60 {
+		return StatusConfiguration
+	}
+	return StatusOK
+}
+
+// RequireExternalPowerAll verifies that every device on the bus has a VDD
+// supply. The Read Power Supply response is wired-AND on a multidrop bus.
+func (network *Network) RequireExternalPowerAll() Status {
+	if status := reset(network.bus); status != StatusOK {
+		return status
+	}
+	network.bus.SendByte(commandSkipROM)
+	network.bus.SendByte(commandReadPowerSupply)
+	if !network.bus.ReadBit() {
+		return StatusParasitePower
+	}
+	return StatusOK
+}
+
+// StartConversionAll broadcasts Convert T to every sensor on the bus.
+func (network *Network) StartConversionAll() Status {
+	if status := reset(network.bus); status != StatusOK {
+		return status
+	}
+	network.bus.SendByte(commandSkipROM)
+	network.bus.SendByte(commandConvertT)
+	return StatusOK
+}
+
+// ReadTemperatureRaw reads one addressed sensor in signed units of 1/16 °C.
+func (network *Network) ReadTemperatureRaw(rom ROM) (int16, Status) {
+	if status := rom.Validate(); status != StatusOK {
+		return 0, status
+	}
+	scratchpad, status := network.readScratchpad(rom)
+	if status != StatusOK {
+		return 0, status
+	}
+	return decodeTemperature(scratchpad)
+}
+
+func (network *Network) requireExternalPower(rom ROM) Status {
+	if status := network.selectROM(rom); status != StatusOK {
+		return status
+	}
+	network.bus.SendByte(commandReadPowerSupply)
+	if !network.bus.ReadBit() {
+		return StatusParasitePower
+	}
+	return StatusOK
+}
+
+func (network *Network) readScratchpad(rom ROM) ([scratchpadSize]byte, Status) {
+	if status := network.selectROM(rom); status != StatusOK {
+		return [scratchpadSize]byte{}, status
+	}
+	network.bus.SendByte(commandReadScratchpad)
+	return receiveScratchpad(network.bus)
+}
+
+func (network *Network) selectROM(rom ROM) Status {
+	if status := reset(network.bus); status != StatusOK {
+		return status
+	}
+	network.bus.SendByte(commandMatchROM)
+	for _, value := range rom {
+		network.bus.SendByte(value)
+	}
+	return StatusOK
+}
+
 // Device drives one DS18B20 on a bus with no other 1-Wire devices.
 type Device struct {
 	bus        onewire.Bus
@@ -94,11 +218,8 @@ func (device *Device) ReadROM() (ROM, Status) {
 	for index := range rom {
 		rom[index] = device.bus.ReceiveByte()
 	}
-	if onewire.CRC8(rom[:7]) != rom[7] {
-		return ROM{}, StatusROMCRC
-	}
-	if rom[0] != FamilyCode {
-		return ROM{}, StatusWrongFamily
+	if status := rom.Validate(); status != StatusOK {
+		return ROM{}, status
 	}
 	return rom, StatusOK
 }
@@ -168,11 +289,7 @@ func (device *Device) ReadTemperatureRaw() (int16, Status) {
 		return 0, status
 	}
 
-	raw := int16(uint16(scratchpad[0]) | uint16(scratchpad[1])<<8)
-	if raw < MinimumTemperatureRaw || raw > MaximumTemperatureRaw {
-		return 0, StatusTemperatureRange
-	}
-	return raw, StatusOK
+	return decodeTemperature(scratchpad)
 }
 
 func (device *Device) requireExternalPower() Status {
@@ -193,11 +310,15 @@ func (device *Device) readScratchpad() ([scratchpadSize]byte, Status) {
 	}
 	device.bus.SendByte(commandSkipROM)
 	device.bus.SendByte(commandReadScratchpad)
+	return receiveScratchpad(device.bus)
+}
+
+func receiveScratchpad(bus onewire.Bus) ([scratchpadSize]byte, Status) {
 
 	var scratchpad [scratchpadSize]byte
 	allZero := true
 	for index := range scratchpad {
-		scratchpad[index] = device.bus.ReceiveByte()
+		scratchpad[index] = bus.ReceiveByte()
 		allZero = allZero && scratchpad[index] == 0
 	}
 	if allZero {
@@ -209,8 +330,20 @@ func (device *Device) readScratchpad() ([scratchpadSize]byte, Status) {
 	return scratchpad, StatusOK
 }
 
+func decodeTemperature(scratchpad [scratchpadSize]byte) (int16, Status) {
+	raw := int16(uint16(scratchpad[0]) | uint16(scratchpad[1])<<8)
+	if raw < MinimumTemperatureRaw || raw > MaximumTemperatureRaw {
+		return 0, StatusTemperatureRange
+	}
+	return raw, StatusOK
+}
+
 func (device *Device) reset() Status {
-	switch device.bus.Reset() {
+	return reset(device.bus)
+}
+
+func reset(bus onewire.Bus) Status {
+	switch bus.Reset() {
 	case onewire.ResetPresent:
 		return StatusOK
 	case onewire.ResetNoPresence:

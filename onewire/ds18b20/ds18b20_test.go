@@ -259,6 +259,103 @@ func TestStatusIsNotError(t *testing.T) {
 	}
 }
 
+func TestROMValidate(t *testing.T) {
+	rom := validROM()
+	if status := rom.Validate(); status != StatusOK {
+		t.Fatalf("Validate() = %v", status)
+	}
+	badCRC := rom
+	badCRC[7] ^= 1
+	if status := badCRC.Validate(); status != StatusROMCRC {
+		t.Errorf("bad CRC status = %v", status)
+	}
+	wrongFamily := rom
+	wrongFamily[0] = 0x10
+	wrongFamily[7] = onewire.CRC8(wrongFamily[:7])
+	if status := wrongFamily.Validate(); status != StatusWrongFamily {
+		t.Errorf("wrong family status = %v", status)
+	}
+}
+
+func TestNetworkConfigure12Bit(t *testing.T) {
+	rom := validROM()
+	scratchpad := validScratchpad(0x1f)
+	verification := validScratchpad(configuration12Bit)
+	readBytes := append(append([]byte{}, scratchpad[:]...), verification[:]...)
+	bus := &fakeBus{readBits: []bool{true}, readBytes: readBytes}
+	network := NewNetwork(bus)
+
+	if status := network.Configure12Bit(rom); status != StatusOK {
+		t.Fatalf("Configure12Bit() = %v", status)
+	}
+	want := append([]byte{}, matchROMBytes(rom)...)
+	want = append(want, commandReadPowerSupply)
+	want = append(want, matchROMBytes(rom)...)
+	want = append(want, commandReadScratchpad)
+	want = append(want, matchROMBytes(rom)...)
+	want = append(want, commandWriteScratchpad, scratchpad[2], scratchpad[3], configuration12Bit)
+	want = append(want, matchROMBytes(rom)...)
+	want = append(want, commandReadScratchpad)
+	assertBytes(t, bus.writtenBytes, want)
+}
+
+func TestNetworkStartConversionAll(t *testing.T) {
+	bus := &fakeBus{}
+	network := NewNetwork(bus)
+	if status := network.StartConversionAll(); status != StatusOK {
+		t.Fatalf("StartConversionAll() = %v", status)
+	}
+	assertBytes(t, bus.writtenBytes, []byte{commandSkipROM, commandConvertT})
+}
+
+func TestNetworkRequireExternalPowerAll(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		bit    bool
+		status Status
+	}{
+		{name: "external", bit: true, status: StatusOK},
+		{name: "parasite", bit: false, status: StatusParasitePower},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bus := &fakeBus{readBits: []bool{test.bit}}
+			network := NewNetwork(bus)
+			if status := network.RequireExternalPowerAll(); status != test.status {
+				t.Fatalf("RequireExternalPowerAll() = %v, want %v", status, test.status)
+			}
+			assertBytes(t, bus.writtenBytes, []byte{commandSkipROM, commandReadPowerSupply})
+		})
+	}
+}
+
+func TestNetworkReadTemperatureRaw(t *testing.T) {
+	rom := validROM()
+	scratchpad := validScratchpad(configuration12Bit)
+	scratchpad[0] = 0x91
+	scratchpad[1] = 0x01
+	scratchpad[8] = onewire.CRC8(scratchpad[:8])
+	bus := &fakeBus{readBytes: scratchpad[:]}
+	network := NewNetwork(bus)
+
+	raw, status := network.ReadTemperatureRaw(rom)
+	if status != StatusOK || raw != 0x0191 {
+		t.Fatalf("ReadTemperatureRaw() = %d, %v", raw, status)
+	}
+	want := append(matchROMBytes(rom), commandReadScratchpad)
+	assertBytes(t, bus.writtenBytes, want)
+}
+
+func TestNetworkRejectsInvalidROMBeforeBusAccess(t *testing.T) {
+	rom := validROM()
+	rom[7] ^= 1
+	bus := &fakeBus{}
+	network := NewNetwork(bus)
+	if status := network.Configure12Bit(rom); status != StatusROMCRC {
+		t.Fatalf("Configure12Bit() = %v, want %v", status, StatusROMCRC)
+	}
+	assertBytes(t, bus.writtenBytes, nil)
+}
+
 func validROM() ROM {
 	rom := ROM{FamilyCode, 0xff, 0x64, 0x1e, 0x93, 0x16, 0x04}
 	rom[7] = onewire.CRC8(rom[:7])
@@ -269,6 +366,11 @@ func validScratchpad(configuration byte) [scratchpadSize]byte {
 	scratchpad := [scratchpadSize]byte{0x50, 0x05, 0x4b, 0x46, configuration, 0xff, 0x0c, 0x10}
 	scratchpad[8] = onewire.CRC8(scratchpad[:8])
 	return scratchpad
+}
+
+func matchROMBytes(rom ROM) []byte {
+	result := []byte{commandMatchROM}
+	return append(result, rom[:]...)
 }
 
 func assertBytes(t *testing.T, got, want []byte) {
