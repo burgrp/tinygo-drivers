@@ -4,7 +4,11 @@ import (
 	"errors"
 	"runtime"
 	"time"
+	_ "unsafe"
 )
+
+//go:linkname monotonicNanoseconds runtime.nanotime
+func monotonicNanoseconds() int64
 
 func enableRxAddress(r Registers, pipeIndex uint8, addr []byte) error {
 	if pipeIndex > 5 {
@@ -90,7 +94,7 @@ const (
 )
 
 func pollBit(r Registers, reg, bit uint8, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	started := monotonicNanoseconds()
 	for {
 		v, err := r.Read(reg)
 		if err != nil {
@@ -99,7 +103,7 @@ func pollBit(r Registers, reg, bit uint8, timeout time.Duration) error {
 		if v&bit != 0 {
 			return nil
 		}
-		if time.Now().After(deadline) {
+		if time.Duration(monotonicNanoseconds()-started) >= timeout {
 			return ErrTimeout
 		}
 		runtime.Gosched()
